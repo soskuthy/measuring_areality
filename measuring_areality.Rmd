@@ -1,0 +1,911 @@
+---
+title: "Areal clustering in /y/"
+author: "Márton Sóskuthy"
+date: "29/06/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Loading data & packages
+
+Reading in phoible & glottolog + loading the relevant packages.
+
+```{r}
+library(tidyverse)
+library(maps)
+library(geodist)
+library(permute)
+
+phoible <- read_csv("raw_data/phoible.csv", 
+                    # below is necessary or parsing failures occur
+                    col_types=cols(InventoryID='i', Marginal='l', .default='c')
+)
+
+glottolog <- read_csv("raw_data/glottolog.csv", col_types=cols(latitude='d', longitude='d', .default='c'))
+
+color1 = "#0571b0"
+color2 = "#ca0020"
+
+```
+
+## Filtering & merging data
+
+One language ID (phoible's unique ID) per iso-code (random sampling).
+
+```{r}
+set.seed(11110111)
+
+# from: https://phoible.org/faq
+phoible %>%
+    distinct(InventoryID, ISO6393) %>%
+    group_by(ISO6393) %>%
+    sample_n(1) %>%
+    pull(InventoryID) ->
+    inventory_ids_sampled_one_per_isocode
+
+phoible <- phoible %>%
+    filter(InventoryID %in% inventory_ids_sampled_one_per_isocode)
+```
+
+Now merging with glottolog data.
+
+```{r}
+phoible <- left_join(phoible, glottolog, by=c(Glottocode="id")) %>%
+    filter(!is.na(latitude))
+```
+
+How many L's? How many L's with each vowel?
+
+```{r}
+n_languages <- length(unique(phoible$Glottocode))
+cat('Altogether', n_languages, 'unique languages.\n')
+
+vowels <- phoible %>%
+    filter(syllabic=="+", 
+           consonantal=="-", 
+           nasal %in% c("0", "-"),
+           periodicGlottalSource %in% c("0", "+"),
+           constrictedGlottis %in% c("0", "-"),
+           spreadGlottis %in% c("0", "-")) %>%
+    count(Phoneme) %>%
+    mutate(prop=n/n_languages) %>%
+    arrange(desc(n))
+
+vowels
+```
+
+Now unique vowel qualities.
+
+```{r}
+vowel_qs <- phoible %>%
+    filter(syllabic=="+", 
+           consonantal=="-", 
+           nasal %in% c("0", "-"),
+           periodicGlottalSource %in% c("0", "+"),
+           constrictedGlottis %in% c("0", "-"),
+           spreadGlottis %in% c("0", "-")) %>%
+    mutate(Phoneme=gsub("ː","",Phoneme)) %>%
+    distinct(Glottocode, Phoneme) %>%
+    count(Phoneme) %>%
+    mutate(prop=n/n_languages) %>%
+    arrange(desc(n))
+
+vowel_qs
+
+```
+## Understanding glottolog
+
+Isolates & families have no family_id:
+
+```{r}
+glottolog %>%
+    filter(is.na(family_id))
+```
+
+Phoible data levels: some "dialects" in the data (can probably leave these).
+
+```{r}
+phoible %>%
+    distinct(Glottocode, level) %>%
+    filter(level!='language')
+```
+
+Let's get language family names for the phoible languages from glottolog.
+
+```{r}
+glotto_families <- glottolog %>%
+    filter(level=='family') %>%
+    rename(family_name = "name") %>%
+    select(id, family_name)
+
+phoible <- left_join(phoible, glotto_families,
+                     by=c(family_id="id")) %>%
+    mutate(family_name = ifelse(is.na(family_name), LanguageName, family_name))
+```
+
+## Data exploration
+
+Looking at vowel quality presence maps for all vowel qualities with 50+ L's.
+
+```{r}
+vowel_qs_50 <- filter(vowel_qs, n >= 50)
+```
+
+Creating database for maps.
+
+```{r}
+phoneme_present <- function (phoneme, db) {
+    return(
+        db %>%
+            group_by(Glottocode) %>%
+            summarise(
+                ISO6393=ISO6393[1],
+                LanguageName=LanguageName[1],
+                Source=Source[1],
+                family_name=family_name[1],
+                latitude=latitude[1],
+                longitude=longitude[1],
+                phoneme=phoneme,
+                present=phoneme %in% Phoneme || paste0(phoneme, "ː") %in% Phoneme
+            ) %>%
+            ungroup()
+    )
+}
+
+phoible_phons <- 
+    purrr::map(vowel_qs_50$Phoneme,
+        phoneme_present,
+        phoible) %>%
+    bind_rows()
+```
+
+```{r}
+world_map <- map_data("world")
+
+map <- ggplot(world_map, aes(x = long, y = lat, group = group)) +
+  geom_polygon(fill = "lightgray", colour = "white", size = 0.2) +
+  geom_point(data = filter(phoible_phons, present), 
+             aes(x = longitude, y = latitude, group = NA),
+             color = color1, size = 1, alpha = 0.5) +
+  coord_map(xlim = c(-180, 180),ylim = c(-90, 90)) +
+  facet_wrap(~phoneme) +
+  #scale_shape_manual(guide = FALSE, values = c(24,25)) +
+  #scale_color_manual(values=c("lightgrey", color1)) +
+  #labs(title = "Map: Presence of consonants in suffixes",
+  #     subtitle = "Vocatives often have no consonants\n") +
+  #theme_voc +
+  theme(
+    legend.position = "right",
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.line = element_blank(),
+    axis.ticks = element_blank())
+
+map
+```
+
+## Clustering analysis
+
+Algorithm:
+
+(1) distance matrix across all pairs of Ls (ouch...)
+
+(2)
+for each language with phoneme P in data:
+    proportion of L's among nearest neighbours with P
+
+calculate average of averages within L families
+
+(3)
+for 1 to iterations:
+    reshuffle P's within families
+    repeat (2)
+    
+(1)
+Distance matrix across all pairs of Ls.
+
+```{r}
+rowcolnames <- distinct(phoible, InventoryID, latitude, longitude)$InventoryID
+
+distances <- 
+    geodist(
+        phoible %>%
+            distinct(InventoryID, latitude, longitude) %>%
+            arrange(InventoryID),
+        measure="geodesic"
+)
+
+rownames(distances) <- rowcolnames
+colnames(distances) <- rowcolnames
+```
+
+Get list of neighbours. (right now: N closest languages) 
+These are indices that you should be able to use on the subsets of data that you work with below.
+
+```{r}
+n_closest <- 10
+
+find_n_closest <- function (inv_id, nn, dmatrix) {
+    ii <- which(rownames(dmatrix)==inv_id)
+    return(order(dmatrix[ii,])[2:(nn+1)])
+}
+
+rnames <- rownames(distances)
+names(rnames) <- rnames
+neighbour_list <- purrr::map(rnames, find_n_closest, n_closest, distances)
+```
+
+For /y/ only.
+
+```{r}
+# repeated from above
+vowel_qs <- phoible %>%
+    filter(syllabic=="+", 
+           consonantal=="-", 
+           nasal %in% c("0", "-"),
+           periodicGlottalSource %in% c("0", "+"),
+           constrictedGlottis %in% c("0", "-"),
+           spreadGlottis %in% c("0", "-")) %>%
+    mutate(Phoneme=gsub("ː","",Phoneme)) %>%
+    distinct(Glottocode, Phoneme) %>%
+    count(Phoneme) %>%
+    mutate(prop=n/n_languages) %>%
+    arrange(desc(n))
+
+
+vowel_qs_50 <- filter(vowel_qs, n >= 50)
+
+phoneme_present <- function (phoneme, db) {
+    return(
+        db %>%
+            group_by(Glottocode) %>%
+            summarise(
+                InventoryID=InventoryID[1],
+                ISO6393=ISO6393[1],
+                LanguageName=LanguageName[1],
+                Source=Source[1],
+                family_name=family_name[1],
+                latitude=latitude[1],
+                longitude=longitude[1],
+                phoneme=phoneme,
+                present=phoneme %in% Phoneme || paste0(phoneme, "ː") %in% Phoneme
+            ) %>%
+            ungroup()
+    )
+}
+
+phoible_phons <- 
+    purrr::map(vowel_qs_50$Phoneme,
+        phoneme_present,
+        phoible) %>%
+    bind_rows() %>%
+    arrange(phoneme, InventoryID)
+
+phoible_phons$InventoryID <- as.character(phoible_phons$InventoryID)
+
+phoible_y <- filter(phoible_phons, phoneme=="y")
+```
+
+Now the fun begins!
+
+```{r}
+prop_of_p_among_neighbours <- function (lang_id, n_list, db) {
+    mean(
+        db$present[n_list[[lang_id]]]
+    )
+}
+
+y_props <- phoible_y %>%
+    filter(present) %>%
+    mutate(prop=purrr::map_dbl(InventoryID, prop_of_p_among_neighbours, neighbour_list, phoible_y))
+
+y_props_mean <- y_props %>%
+    group_by(family_name) %>%
+    summarise(prop_mean = mean(prop)) %>%
+    ungroup() %>%
+    pull(prop_mean) %>%
+    mean()
+```
+
+And now some Monte Carlo samples.
+
+```{r}
+iterations <- 10000
+y_props_means <- rep(0, iterations)
+perms <- shuffleSet(nrow(phoible_y), iterations, control=how(blocks=phoible_y$family_name))
+phoible_y_perm <- phoible_y
+for (i in 1:iterations) {
+    phoible_y_perm$present <- phoible_y$present[perms[i,]]
+        #group_by(family_name) %>%
+        #mutate(present=sample(present, replace=F)) %>%
+        #ungroup()
+    
+    y_props <- phoible_y_perm %>%
+    filter(present) %>%
+    mutate(prop=purrr::map_dbl(InventoryID, prop_of_p_among_neighbours, neighbour_list, phoible_y_perm))
+
+    y_props_means[i] <- y_props %>%
+        group_by(family_name) %>%
+        summarise(prop_mean = mean(prop)) %>%
+        ungroup() %>%
+        pull(prop_mean) %>%
+        mean()
+    cat("            \r", i, sep="")
+}
+
+hist(y_props_means, 20)
+ecdf(y_props_means)(y_props_mean)
+qlogis(ecdf(y_props_means)(y_props_mean))
+```
+
+Let's do this for some other vowels too!
+
+```{r}
+iterations <- 10000
+
+# objects to store data
+all_props <- tibble(vowel="",
+                    prop=0,
+                    quantile=0)[0,]
+monte_carlo <- list()
+
+
+# main loop
+set.seed(11110111)
+for (v in vowel_qs_50$Phoneme) {
+    phoible_v <- filter(phoible_phons, phoneme==v)
+    
+    # observed mean
+    v_props <- phoible_v %>%
+        filter(present) %>%
+        mutate(prop=purrr::map_dbl(InventoryID, prop_of_p_among_neighbours, neighbour_list, phoible_v))
+
+    v_props_mean <- v_props %>%
+        group_by(family_name) %>%
+        summarise(prop_mean = mean(prop)) %>%
+        ungroup() %>%
+        pull(prop_mean) %>%
+        mean()
+    
+    # monte carlo
+    monte_carlo[[v]] <- rep(0, iterations)
+    perms <- shuffleSet(nrow(phoible_v), iterations, control=how(blocks=phoible_v$family_name))
+    phoible_v_perm <- phoible_v
+    for (i in 1:iterations) {
+        phoible_v_perm$present <- phoible_v$present[perms[i,]]
+        #phoible_v_perm <- phoible_v %>%
+        #    group_by(family_name) %>%
+        #    mutate(present=sample(present, replace=F)) %>%
+        #    ungroup()
+    
+        v_props <- phoible_v_perm %>%
+            filter(present) %>%
+            mutate(prop=purrr::map_dbl(InventoryID, prop_of_p_among_neighbours, neighbour_list, phoible_v_perm))
+
+        monte_carlo[[v]][i] <- v_props %>%
+            group_by(family_name) %>%
+            summarise(prop_mean = mean(prop)) %>%
+            ungroup() %>%
+            pull(prop_mean) %>%
+            mean()
+        cat("            \r", "/", v, "/: ", i, sep="")
+    }
+    all_props <- add_row(all_props,
+                         vowel=v,
+                         prop=v_props_mean,
+                         quantile=ecdf(monte_carlo[[v]])(v_props_mean)
+    )
+}
+all_props
+
+#saveRDS(all_props, "models/monte_carlo_summary.rds")
+#saveRDS(monte_carlo, "models/monte_carlo_raw.rds")
+all_props <- readRDS("models/monte_carlo_summary.rds")
+monte_carlo <- readRDS("models/monte_carlo_raw.rds") 
+```
+
+Let's look!
+
+```{r}
+all_props$quantile_logit <- qlogis(all_props$quantile)
+hist(all_props$quantile_logit)
+
+all_props %>%
+    arrange(desc(quantile_logit))
+
+monte_carlo
+```
+
+Would be interesting to zoom in on the top 4-5 languages:
+
+```{r}
+# top 4 (better for plotting)
+vs_to_plot <- all_props %>%
+    arrange(desc(quantile_logit)) %>%
+    head(4) %>%
+    pull(vowel)
+
+
+world_map <- map_data("world")
+
+map <- ggplot(world_map, aes(x = long, y = lat, group = group)) +
+  geom_polygon(fill = "lightgray", colour = "white", size = 0.2) +
+  geom_point(data = filter(phoible_phons, present, phoneme %in% vs_to_plot), 
+             aes(x = longitude, y = latitude, group = NA),
+             color = color1, size = 1, alpha = 0.5) +
+  coord_map(xlim = c(-180, 180),ylim = c(-90, 90)) +
+  facet_wrap(~phoneme) +
+  #scale_shape_manual(guide = FALSE, values = c(24,25)) +
+  #scale_color_manual(values=c("lightgrey", color1)) +
+  #labs(title = "Map: Presence of consonants in suffixes",
+  #     subtitle = "Vocatives often have no consonants\n") +
+  #theme_voc +
+  theme(
+    legend.position = "right",
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.line = element_blank(),
+    axis.ticks = element_blank())
+
+map
+```
+## Visualising areal patterns
+
+Three vowels - raw distribution data.
+
+/y/.
+
+```{r}
+local_average <- function (tile, dat, outcome) {
+  dists <- geodist(
+    tile,
+    dat[,c("longitude","latitude")],
+    measure="geodesic"
+  )
+  summed_prox <- sum(exp(-(dists[1,]/500000)**2)) 
+  avg <- sum(exp(-(dists[1,]/500000)**2) * pull(dat, outcome)) / summed_prox
+  return(data.frame(avg=avg, summed_prox=summed_prox/nrow(dat)))
+}
+
+vs <- c("y", "ɛ")
+
+vs_props <- list()
+pds <- list()
+
+for (v in vs) {
+  
+  phoible_v <- phoible_phons %>%
+    filter(phoneme==v)
+
+  v_props <- phoible_v %>%
+    filter(present) %>%
+    mutate(prop=
+             purrr::map_dbl(
+               InventoryID, 
+               prop_of_p_among_neighbours, 
+               #neighbour_list, 
+               neighbour_list_other_family,
+               phoible_v
+             )
+    )
+  
+  v_props$prop_norm <- qlogis((v_props$prop*0.98)+0.01) - mean(qlogis(monte_carlo_other_family[[v]]))
+  
+  
+  
+  vs_props[[v]] <- v_props
+  
+  v_props$family_name_f <- as.factor(v_props$family_name)
+  
+  pd <-
+    expand.grid(
+      latitude=seq(-87.5,87.5,5),
+      longitude=seq(-177.5,177.5,5)
+    )
+  
+  pd <- bind_cols(pd, bind_rows(apply(pd, 1, local_average, v_props, "prop_norm")))
+  
+  # 
+  # pd$prop <- predict(v_2d_smooth,pd,
+  #                    type="link",
+  #                    exclude="s(family_name_f)")
+  # 
+  # pd$clustering <- pd$prop - mean(qlogis(monte_carlo_other_family[[v]]))
+  pd$phoneme <- v
+  # 
+  pds[[v]] <- pd
+}
+
+pds <- bind_rows(pds)
+
+vs_props <- bind_rows(vs_props)
+world_map <- map_data("world")
+
+pds <- pds %>%
+  group_by(phoneme) %>%
+  mutate(avg_pos=pmax(0,avg),
+         avg_pos=avg_pos / max(avg_pos)) %>%
+  ungroup()
+
+ggplot(vs_props, aes(x=longitude, y=latitude, col=prop_norm)) +
+  facet_wrap(.~phoneme) +
+  coord_map(xlim = c(-180, 180),ylim = c(-55, 75)) +
+  geom_tile(data=pds, aes(fill=avg_pos, alpha=pmax(-8,log(summed_prox))), col=NA) +
+  geom_polygon(
+    data=world_map, 
+    aes(x = long, y = lat, group = group),
+    fill = NA, colour = "darkgrey", size = 0.1) +
+  #geom_point(fill=NA, alpha=0.5, size=1, pch=16) +
+  #scale_fill_viridis_c() +
+  #scale_colour_viridis_c(guide="none") +
+  scale_fill_gradient(low="white", high=color1, guide="none") +
+  scale_alpha_continuous(range=c(0,1), guide="none") +
+  theme_minimal() +
+  theme(axis.text=element_blank(),
+        axis.title=element_blank(),
+        panel.grid=element_blank(),
+        strip.text=element_blank())
+ggsave("graphs/smoothed_Ey.pdf", width=6, height=1.8)
+
+#ggarrange(plot_a, plot_b,
+#          ncol=1, nrow=2,
+#          align="v")
+```
+
+Raw data.
+
+```{r}
+vs <- c("y", "ɛ", "ə")
+
+phoible_vs <- phoible_phons %>%
+  filter(phoneme %in% vs) %>%
+  mutate(phoneme=factor(phoneme, levels=c("ə", "ɛ", "y"))) %>%
+  arrange(present)
+
+ggplot(phoible_vs, aes(x=longitude, y=latitude, col=present)) +
+  facet_wrap(.~phoneme) +
+  coord_map(xlim = c(-180, 180),ylim = c(-55, 75)) +
+  geom_polygon(
+    data=world_map, 
+    aes(x = long, y = lat, group = group),
+    fill = NA, colour = "darkgrey", size = 0.1) +
+  geom_point(fill=NA, alpha=0.5, size=1, pch=16) +
+  scale_colour_manual(values=c("grey", color1), guide="none") +
+  theme_minimal() +
+  theme(axis.text=element_blank(),
+        axis.title=element_blank(),
+        panel.grid=element_blank(),
+        strip.text=element_blank())
+ggsave("graphs/raw_@Ey.pdf", width=9, height=1.8)
+```
+
+/I/.
+
+```{r}
+phoible_I <- phoible_phons %>%
+  filter(phoneme=="ɪ")
+
+I_props <- phoible_I %>%
+  filter(present) %>%
+  mutate(prop=purrr::map_dbl(InventoryID, prop_of_p_among_neighbours, neighbour_list, phoible_I))
+
+I_props$family_name_f <- as.factor(I_props$family_name)
+I_2d_smooth <- gam(
+  prop ~ s(latitude, longitude, bs="sos", k=60) +
+    s(family_name_f, bs="re"),
+  data=I_props,
+  family=betar(link="logit")
+)
+summary(I_2d_smooth)
+
+pd <- 
+  expand.grid(
+    latitude=seq(-87.5,87.5,5),
+    longitude=seq(-177.5,177.5,5),
+    family_name_f="Indo-European"
+  )
+# removing tiles with no data nearby
+
+dists <- geodist(
+  pd[,c("latitude","longitude")],
+  I_props[,c("latitude","longitude")],
+  measure="geodesic"
+)
+
+min_dists <- apply(dists, 1, min)
+
+pd$min_dist <- min_dists
+
+pd$prop <- predict(I_2d_smooth,pd,
+                   type="link",
+                   exclude="s(family_name_f)")
+
+pd$clustering <- pd$prop - mean(qlogis(monte_carlo[["ɪ"]]))
+
+ggplot(pd, aes(x=longitude, y=latitude, fill=clustering)) +
+  geom_tile(col=NA, width=5, height=5) +
+  geom_polygon(
+    data=world_map, 
+    aes(x = long, y = lat, group = group),
+    fill = NA, colour = "white", size = 0.2) +
+  coord_map(xlim = c(-180, 180),ylim = c(-60, 80), projection="mollweide") +
+  scale_fill_viridis_c()
+```
+
+/ɯ/.
+
+```{r}
+phoible_w <- phoible_phons %>%
+  filter(phoneme=="ɯ")
+
+w_props <- phoible_w %>%
+  filter(present) %>%
+  mutate(prop=purrr::map_dbl(InventoryID, prop_of_p_among_neighbours, neighbour_list, phoible_w))
+
+w_props$family_name_f <- as.factor(w_props$family_name)
+w_2d_smooth <- gam(
+  prop ~ s(latitude, longitude, bs="sos", k=60) +
+    s(family_name_f, bs="re"),
+  data=w_props,
+  family=betar(link="logit")
+)
+summary(w_2d_smooth)
+
+pd <- 
+  expand.grid(
+    latitude=seq(-87.5,87.5,5),
+    longitude=seq(-177.5,177.5,5),
+    family_name_f="Indo-European"
+  )
+# removing tiles with no data nearby
+
+dists <- geodist(
+  pd[,c("latitude","longitude")],
+  I_props[,c("latitude","longitude")],
+  measure="geodesic"
+)
+
+min_dists <- apply(dists, 1, min)
+
+pd$min_dist <- min_dists
+
+pd$prop <- predict(w_2d_smooth,pd,
+                   type="link",
+                   exclude="s(family_name_f)")
+
+pd$clustering <- pd$prop - mean(qlogis(monte_carlo[["ɯ"]]))
+
+ggplot(pd, aes(x=longitude, y=latitude, fill=clustering)) +
+  geom_tile(col=NA, width=5, height=5) +
+  geom_polygon(
+    data=world_map, 
+    aes(x = long, y = lat, group = group),
+    fill = NA, colour = "white", size = 0.2) +
+  coord_map(xlim = c(-180, 180),ylim = c(-60, 80), projection="mollweide") +
+  scale_fill_viridis_c()
+```
+
+
+
+
+## Across families only
+
+We tweak the nearest neighbour list to only include l's from other language families. Otherwise the code remains the same.
+
+```{r}
+n_closest <- 10
+
+find_n_closest_other_family <- function (inv_id, family, nn, dmatrix) {
+    ii <- which(rownames(dmatrix)==inv_id)
+    family_iis <- which(family==family[ii])
+    dists <- dmatrix[ii,]
+    dists[family_iis] <- dists[family_iis] + 10000000000 # 10 million km + for same language
+    return(order(dists)[2:(nn+1)])
+}
+
+family <- phoible %>%
+    distinct(InventoryID, family_name) %>% 
+    arrange(InventoryID) %>% 
+    pull(family_name)
+rnames <- rownames(distances)
+names(rnames) <- rnames
+neighbour_list_other_family <- purrr::map(rnames, find_n_closest_other_family, family, n_closest, distances)
+```
+
+And now running monte carlo again.
+
+```{r}
+iterations <- 10000
+
+# objects to store data
+all_props_other_family <- tibble(vowel="",
+                    prop=0,
+                    quantile=0)[0,]
+monte_carlo_other_family <- list()
+
+
+# main loop
+set.seed(11110111)
+for (v in vowel_qs_50$Phoneme) {
+    phoible_v <- filter(phoible_phons, phoneme==v)
+    
+    # observed mean
+    v_props <- phoible_v %>%
+        filter(present) %>%
+        mutate(prop=purrr::map_dbl(InventoryID, prop_of_p_among_neighbours, neighbour_list_other_family, phoible_v))
+
+    v_props_mean <- v_props %>%
+        group_by(family_name) %>%
+        summarise(prop_mean = mean(prop)) %>%
+        ungroup() %>%
+        pull(prop_mean) %>%
+        mean()
+    
+    # monte carlo
+    monte_carlo_other_family[[v]] <- rep(0, iterations)
+    perms <- shuffleSet(nrow(phoible_v), iterations, control=how(blocks=phoible_v$family_name))
+    phoible_v_perm <- phoible_v
+    for (i in 1:iterations) {
+        phoible_v_perm$present <- phoible_v$present[perms[i,]]
+        #phoible_v_perm <- phoible_v %>%
+        #    group_by(family_name) %>%
+        #    mutate(present=sample(present, replace=F)) %>%
+        #    ungroup()
+    
+        v_props <- phoible_v_perm %>%
+            filter(present) %>%
+            mutate(prop=purrr::map_dbl(InventoryID, prop_of_p_among_neighbours, neighbour_list_other_family, phoible_v_perm))
+
+        monte_carlo_other_family[[v]][i] <- v_props %>%
+            group_by(family_name) %>%
+            summarise(prop_mean = mean(prop)) %>%
+            ungroup() %>%
+            pull(prop_mean) %>%
+            mean()
+        cat("            \r", "/", v, "/: ", i, sep="")
+    }
+    all_props_other_family <- add_row(all_props_other_family,
+                         vowel=v,
+                         prop=v_props_mean,
+                         quantile=ecdf(monte_carlo_other_family[[v]])(v_props_mean)
+    )
+}
+all_props_other_family %>%
+    arrange(desc(quantile))
+
+#saveRDS(all_props_other_family, "models/monte_carlo_exfamily_summary.rds")
+#saveRDS(monte_carlo_other_family, "models/monte_carlo_exfamily_raw.rds")
+all_props_other_family <- readRDS("models/monte_carlo_exfamily_summary.rds")
+monte_carlo_other_family <- readRDS("models/monte_carlo_exfamily_raw.rds")
+```
+
+## Areal analysis without Africa
+
+The purpose of this analysis is to ascertain whether the high clustering observed for -ATR vowels is due to a large & diverse sample of languages with ATR harmony from Africa. Note that ATR harmony has been proposed as an areal feature.
+
+```{r}
+glotto_geo <- read_csv('data/raw_data/glottolog_geo.csv')
+
+phoible_phons_afr_excluded <- left_join(phoible_phons, select(glotto_geo, glottocode, macroarea),
+                           by=c(Glottocode="glottocode")) %>% 
+    filter(!is.na(macroarea)) %>%
+    filter(macroarea != 'Africa') %>%
+    arrange(phoneme, InventoryID)
+
+# fix neighbour list
+rowcolnames_afr_excl <- phoible_phons_afr_excluded %>%
+    distinct(InventoryID, latitude, longitude) %>%
+    arrange(InventoryID) %>%
+    pull(InventoryID)
+
+distances_afr_excl <- 
+    geodist(
+        phoible_phons_afr_excluded %>%
+            distinct(InventoryID, latitude, longitude) %>%
+            arrange(InventoryID),
+        measure="geodesic"
+)
+
+rownames(distances_afr_excl) <- rowcolnames_afr_excl
+colnames(distances_afr_excl) <- rowcolnames_afr_excl
+
+n_closest <- 10
+
+rnames_afr_excl <- rownames(distances_afr_excl)
+names(rnames_afr_excl) <- rnames_afr_excl
+neighbour_list_afr_excl <- purrr::map(rnames_afr_excl, find_n_closest, n_closest, distances_afr_excl)
+```
+
+Now we run the monte carlo simulations.
+
+```{r}
+prop_of_p_among_neighbours <- function (lang_id, n_list, db) {
+    mean(
+        db$present[n_list[[lang_id]]]
+    )
+}
+
+iterations <- 10000
+
+# objects to store data
+all_props_afr_excluded <- tibble(vowel="",
+                    prop=0,
+                    quantile=0)[0,]
+monte_carlo_afr_excluded <- list()
+
+
+# main loop
+set.seed(11110111)
+for (v in vowel_qs_50$Phoneme) {
+    phoible_v <- filter(phoible_phons_afr_excluded, phoneme==v)
+    
+    # observed mean
+    v_props <- phoible_v %>%
+        filter(present) %>%
+        mutate(prop=purrr::map_dbl(InventoryID, prop_of_p_among_neighbours, neighbour_list_afr_excl, phoible_v))
+
+    v_props_mean <- v_props %>%
+        group_by(family_name) %>%
+        summarise(prop_mean = mean(prop)) %>%
+        ungroup() %>%
+        pull(prop_mean) %>%
+        mean()
+    
+    # monte carlo
+    monte_carlo_afr_excluded[[v]] <- rep(0, iterations)
+    perms <- shuffleSet(nrow(phoible_v), iterations, control=how(blocks=phoible_v$family_name))
+    phoible_v_perm <- phoible_v
+    for (i in 1:iterations) {
+        phoible_v_perm$present <- phoible_v$present[perms[i,]]
+    
+        v_props <- phoible_v_perm %>%
+            filter(present) %>%
+            mutate(prop=purrr::map_dbl(InventoryID, prop_of_p_among_neighbours, neighbour_list_afr_excl, phoible_v_perm))
+
+        monte_carlo_afr_excluded[[v]][i] <- v_props %>%
+            group_by(family_name) %>%
+            summarise(prop_mean = mean(prop)) %>%
+            ungroup() %>%
+            pull(prop_mean) %>%
+            mean()
+        cat("            \r", "/", v, "/: ", i, sep="")
+    }
+    all_props_afr_excluded <- add_row(all_props_afr_excluded,
+                         vowel=v,
+                         prop=v_props_mean,
+                         quantile=ecdf(monte_carlo[[v]])(v_props_mean)
+    )
+}
+
+saveRDS(all_props_afr_excluded, "models/monte_carlo_excl_afr_summary.rds")
+saveRDS(monte_carlo_afr_excluded, "models/monte_carlo_excl_afr_raw.rds")
+```
+
+```{r}
+all_props_afr_excluded$quantile_logit <- qlogis(all_props_afr_excluded$quantile)
+hist(all_props_afr_excluded$quantile_logit)
+
+all_props_afr_excluded %>%
+    arrange(desc(quantile_logit))
+
+monte_carlo
+```
+Is the influence of Africa on our estimates disproportionately large?
+
+```{r}
+left_join(phoible_phons, select(glotto_geo, glottocode, macroarea),
+                           by=c(Glottocode="glottocode")) %>% 
+    filter(!is.na(macroarea)) %>%
+    distinct(family_name, macroarea) %>%
+    count(macroarea)
+```
+
+Not really disproportionate at all! The number of language families in Africa is similar to that in other macroareas.
+
+## To do
+
+--
+(3) plot of distributions for talk
